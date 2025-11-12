@@ -78,6 +78,8 @@ class ESPSerialBridge(Node):
             'cmd_vel',
             self.cmd_vel_callback,
             10  # QoS queue size
+        self.cmd_vel_duration = 200  # default fallback in ms (used only if no duration provided)
+
         )
 
     def _periodic_ping(self):
@@ -206,7 +208,7 @@ class ESPSerialBridge(Node):
         max_speed = 0.3  # m/s, adjust as needed
         left_pwm = int(max(min(v_l / max_speed, 1.0), -1.0) * self._max_pwm)
         right_pwm = int(max(min(v_r / max_speed, 1.0), -1.0) * self._max_pwm)
-        duration_ms = cmd.get("duration_ms", 0)
+        duration_ms = cmd.get("duration_ms", self.cmd_vel_duration)
         # Send VEL command
         cmd = f"VEL,{left_pwm},{right_pwm},{duration_ms}\n"
         try:
