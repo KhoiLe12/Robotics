@@ -72,6 +72,14 @@ class ESPSerialBridge(Node):
 
         self.timer = self.create_timer(1.0, self._periodic_ping)
 
+            # inside ESPBridgeNode.__init__()
+        self.cmd_vel_sub = self.create_subscription(
+            Twist,
+            'cmd_vel',
+            self.cmd_vel_callback,
+            10  # QoS queue size
+        )
+
     def _periodic_ping(self):
         try:
             self.ser.write(b'GET\n')
