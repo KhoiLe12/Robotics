@@ -78,7 +78,12 @@ class ESPSerialBridge(Node):
             'cmd_vel',
             self.cmd_vel_callback,
             10  # QoS queue size
-        self.cmd_vel_duration = 200  # default fallback in ms (used only if no duration provided)
+            
+        self._max_pwm = 255
+        self._cmd_vel_duration = 200
+        self._cmd_vel_timeout = 1.0
+        self._last_cmd_time = self.get_clock().now()
+        # default fallback in ms (used only if no duration provided)
 
         )
 
