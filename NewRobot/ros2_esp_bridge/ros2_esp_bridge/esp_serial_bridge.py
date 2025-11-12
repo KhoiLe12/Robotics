@@ -72,19 +72,6 @@ class ESPSerialBridge(Node):
 
         self.timer = self.create_timer(1.0, self._periodic_ping)
 
-            # inside ESPBridgeNode.__init__()
-        self.cmd_vel_sub = self.create_subscription(
-            Twist,
-            'cmd_vel',
-            self.cmd_vel_callback,
-            10  # QoS queue size
-        )
-        self._max_pwm = 255
-        self._cmd_vel_duration = 200  # ms
-        self._cmd_vel_timeout = 1.0
-        self._last_cmd_time = self.get_clock().now()
-        # default fallback in ms (used only if no duration provided)
-
     def _periodic_ping(self):
         try:
             self.ser.write(b'GET\n')
@@ -156,6 +143,7 @@ class ESPSerialBridge(Node):
     
     def _update_odometry(self, left_ticks: int, right_ticks: int):
         current_time = self.get_clock().now()
+        
         if self.first_reading:
             # Initialize on first reading
             self.last_left_ticks = left_ticks
@@ -163,27 +151,34 @@ class ESPSerialBridge(Node):
             self.last_time = current_time
             self.first_reading = False
             return
+        
         # Calculate change in encoder ticks
         delta_left = left_ticks - self.last_left_ticks
         delta_right = right_ticks - self.last_right_ticks
+        
         # Convert ticks to distance (meters)
         meters_per_tick = (2.0 * math.pi * self.wheel_radius) / self.ticks_per_rev
         left_distance = delta_left * meters_per_tick
         right_distance = delta_right * meters_per_tick
+        
         # Calculate robot motion
         distance = (left_distance + right_distance) / 2.0
         delta_theta = (right_distance - left_distance) / self.wheelbase
+        
         # Update robot pose
         delta_x = distance * math.cos(self.theta + delta_theta / 2.0)
         delta_y = distance * math.sin(self.theta + delta_theta / 2.0)
+        
         self.x += delta_x
         self.y += delta_y
         self.theta += delta_theta
+        
         # Normalize theta to [-pi, pi]
         while self.theta > math.pi:
             self.theta -= 2.0 * math.pi
         while self.theta < -math.pi:
             self.theta += 2.0 * math.pi
+        
         # Calculate velocities
         dt = (current_time - self.last_time).nanoseconds / 1e9
         if dt > 0:
@@ -192,43 +187,14 @@ class ESPSerialBridge(Node):
         else:
             linear_vel = 0.0
             angular_vel = 0.0
+        
         # Publish odometry message
         self._publish_odometry(current_time, linear_vel, angular_vel)
+        
         # Update last values
         self.last_left_ticks = left_ticks
         self.last_right_ticks = right_ticks
         self.last_time = current_time
-
-    # --- Properly indented class methods for cmd_vel ---
-    def cmd_vel_callback(self, msg):
-        # Convert Twist to left/right wheel velocities (differential drive)
-        v = msg.linear.x  # m/s
-        omega = msg.angular.z  # rad/s
-        # Differential drive kinematics
-        v_l = v - (omega * self.wheelbase / 2.0)
-        v_r = v + (omega * self.wheelbase / 2.0)
-        # Convert to PWM (simple proportional mapping)
-        max_speed = 0.3  # m/s, adjust as needed
-        left_pwm = int(max(min(v_l / max_speed, 1.0), -1.0) * self._max_pwm)
-        right_pwm = int(max(min(v_r / max_speed, 1.0), -1.0) * self._max_pwm)
-        duration_ms = self._cmd_vel_duration  # Use default duration
-        # Send VEL command
-        cmd = f"VEL,{left_pwm},{right_pwm},{duration_ms}\n"
-        try:
-            self.ser.write(cmd.encode())
-            self.get_logger().info(f"Sent: {cmd.strip()}")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to send VEL command: {e}")
-        self._last_cmd_time = time.time()
-
-    def _cmd_vel_safety_check(self):
-        # If no cmd_vel received recently, send STOP
-        if (time.time() - self._last_cmd_time) > self._cmd_vel_timeout:
-            try:
-                self.ser.write(b'STOP\n')
-            except Exception:
-                pass
-            self._last_cmd_time = time.time()  # Prevent spamming STOP
     
     def _publish_odometry(self, current_time, linear_vel: float, angular_vel: float):
         # Create odometry message
