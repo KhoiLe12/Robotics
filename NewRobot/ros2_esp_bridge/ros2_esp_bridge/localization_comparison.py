@@ -44,6 +44,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
+LIDAR_YAW_OFFSET = 1.5708
+
 class LandmarkTracker(Node):
     def __init__(self):
         super().__init__('landmark_tracker')
@@ -131,6 +133,8 @@ class LandmarkTracker(Node):
         
         ranges = np.array(scan.ranges)
         angles = np.linspace(scan.angle_min, scan.angle_max, len(ranges))
+        angles = angles + LIDAR_YAW_OFFSET
+        angles = (angles + np.pi) % (2 * np.pi) - np.pi
         
         # Convert to Cartesian coordinates
         valid_mask = ~(np.isinf(ranges) | np.isnan(ranges) | (ranges < 0.1) | (ranges > 4.0))
@@ -307,6 +311,8 @@ class LandmarkTracker(Node):
         
         ranges = np.array(scan.ranges)
         angles = np.linspace(scan.angle_min, scan.angle_max, len(ranges))
+        angles = angles + LIDAR_YAW_OFFSET
+        angles = (angles + np.pi) % (2 * np.pi) - np.pi
         wall_distances = {}
         
         # Look for walls in different directions
