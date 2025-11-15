@@ -123,18 +123,15 @@ class AStarPlanner:
             return 10  # Straight cost
     
     def get_neighbors(self, point):
-        """Get valid neighboring points (8-connected)"""
+        """Get valid neighboring points (4-connected - up, down, left, right)"""
         neighbors = []
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0:
-                    continue
-                    
-                neighbor = (point[0] + dx, point[1] + dy)
-                
-                if (self.is_within_grid(neighbor[0], neighbor[1]) and 
-                    self.loaded_map[neighbor[1], neighbor[0]] == 0):
-                    neighbors.append(neighbor)
+        # 4-connected movement (not 8-connected)
+        for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:  # Only cardinal directions
+            neighbor = (point[0] + dx, point[1] + dy)
+            
+            if (self.is_within_grid(neighbor[0], neighbor[1]) and 
+                self.loaded_map[neighbor[1], neighbor[0]] == 0):
+                neighbors.append(neighbor)
         
         return neighbors
     
@@ -288,4 +285,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
