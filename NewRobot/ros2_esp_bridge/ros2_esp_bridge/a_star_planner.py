@@ -106,12 +106,21 @@ class AStarPlanner:
         return None
     
     def heuristic(self, a, b):
-        """Manhattan distance heuristic"""
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-    
+        """Euclidean distance heuristic scaled to match movement costs"""
+        dx = abs(a[0] - b[0])
+        dy = abs(a[1] - b[1])
+        # Use Chebyshev distance or scaled Euclidean for 8-connected grids
+        return 10 * max(dx, dy)  # Better for 8-connected movement
+
     def distance(self, a, b):
-        """Distance between two grid points"""
-        return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+        """Normalized movement costs: straight=10, diagonal=14"""
+        dx = abs(a[0] - b[0])
+        dy = abs(a[1] - b[1])
+        
+        if dx == 1 and dy == 1:
+            return 14  # Diagonal cost: 10 * √2 ≈ 14
+        else:
+            return 10  # Straight cost
     
     def get_neighbors(self, point):
         """Get valid neighboring points (8-connected)"""
@@ -279,3 +288,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
