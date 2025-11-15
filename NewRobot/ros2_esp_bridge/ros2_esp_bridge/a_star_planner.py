@@ -139,58 +139,74 @@ class AStarPlanner:
         return path
     
     def visualize_path(self, path, start_grid, goal_grid):
-        """Visualize the map with the planned path"""
+        """Visualize the map with the planned path - WITH DEBUG"""
         if self.loaded_map is None:
             print("❌ No map loaded!")
             return
         
-        plt.figure(figsize=(10, 10))
+        print("🔄 Creating visualization...")
+        
+        plt.figure(figsize=(12, 10))
+        
+        # Create custom colormap
+        from matplotlib.colors import ListedColormap
+        cmap = ListedColormap(['black', 'white'])  # Black=free, White=occupied
         
         # Plot the binary map
-        plt.imshow(self.loaded_map, cmap='binary', origin='lower', 
-                  extent=[self.grid_origin[0], 
-                         self.grid_origin[0] + self.grid_size * self.map_resolution,
-                         self.grid_origin[1],
-                         self.grid_origin[1] + self.grid_size * self.map_resolution])
+        plt.imshow(self.loaded_map, cmap=cmap, origin='lower', 
+                extent=[self.grid_origin[0], 
+                        self.grid_origin[0] + self.grid_size * self.map_resolution,
+                        self.grid_origin[1],
+                        self.grid_origin[1] + self.grid_size * self.map_resolution],
+                alpha=0.8)
         
-        # Plot path
+        # Plot path if provided
         if path is not None:
             path_x = [self.grid_to_world(x, y)[0] for x, y in path]
             path_y = [self.grid_to_world(x, y)[1] for x, y in path]
-            plt.plot(path_x, path_y, 'r-', linewidth=3, label='A* Path')
+            plt.plot(path_x, path_y, 'r-', linewidth=4, label='A* Path')
+            plt.plot(path_x, path_y, 'ro', markersize=3, alpha=0.6)
+            print(f"📏 Path plotted with {len(path)} points")
         
         # Plot start and goal
         start_world = self.grid_to_world(start_grid[0], start_grid[1])
         goal_world = self.grid_to_world(goal_grid[0], goal_grid[1])
         
-        plt.plot(start_world[0], start_world[1], 'go', markersize=12, label='Start')
-        plt.plot(goal_world[0], goal_world[1], 'bo', markersize=12, label='Goal')
+        plt.plot(start_world[0], start_world[1], 'go', markersize=15, 
+                label='Start', markeredgecolor='darkgreen', markeredgewidth=2)
+        plt.plot(goal_world[0], goal_world[1], 'bo', markersize=15, 
+                label='Goal', markeredgecolor='darkblue', markeredgewidth=2)
+        
+        # Add grid lines
+        for i in range(self.grid_size + 1):
+            x_pos = self.grid_origin[0] + i * self.map_resolution
+            y_pos = self.grid_origin[1] + i * self.map_resolution
+            plt.axvline(x=x_pos, color='#666666', linewidth=0.5, alpha=0.8)
+            plt.axhline(y=y_pos, color='#666666', linewidth=0.5, alpha=0.8)
         
         # Add orientation indicators
         center_x = (self.grid_origin[0] + self.grid_origin[0] + self.grid_size * self.map_resolution) / 2
         center_y = (self.grid_origin[1] + self.grid_origin[1] + self.grid_size * self.map_resolution) / 2
         
-        plt.arrow(center_x, center_y, 0.2, 0, head_width=0.05, head_length=0.05, fc='red', ec='red', label='Robot Front')
-        plt.arrow(center_x, center_y, 0, 0.2, head_width=0.05, head_length=0.05, fc='blue', ec='blue', label='LiDAR Front')
+        plt.arrow(center_x, center_y, 0.2, 0, head_width=0.05, head_length=0.05, 
+                fc='red', ec='red', linewidth=2, label='Robot Front')
+        plt.arrow(center_x, center_y, 0, 0.2, head_width=0.05, head_length=0.05, 
+                fc='blue', ec='blue', linewidth=2, label='LiDAR Front')
         
-        plt.title('A* Path Planning on 30×30 Binary Grid\n(LiDAR pointing left)', fontsize=14, fontweight='bold')
+        plt.title('A* Path Planning', fontsize=16, fontweight='bold')
         plt.xlabel('X (meters)')
         plt.ylabel('Y (meters)')
-        plt.grid(True, alpha=0.3)
         plt.legend()
+        plt.grid(True, alpha=0.3)
         
-        # Add grid lines
-        plt.gca().set_xticks(np.arange(self.grid_origin[0], 
-                                     self.grid_origin[0] + self.grid_size * self.map_resolution + 0.1, 
-                                     self.map_resolution))
-        plt.gca().set_yticks(np.arange(self.grid_origin[1],
-                                     self.grid_origin[1] + self.grid_size * self.map_resolution + 0.1,
-                                     self.map_resolution))
-        plt.gca().grid(True, which='both', alpha=0.2)
+        # Save to file first
+        plt.savefig('a_star_path.png', dpi=150, bbox_inches='tight')
+        print("✅ Visualization saved to a_star_path.png")
         
-        plt.tight_layout()
-        plt.show()
-    
+        # Then try to show
+        plt.show(block=True)
+        print("📊 Visualization window should be open")
+
     def print_path_coordinates(self, path):
         """Print path coordinates in both grid and world coordinates"""
         if not path:
