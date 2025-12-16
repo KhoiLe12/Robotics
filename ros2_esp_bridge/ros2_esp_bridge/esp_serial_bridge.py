@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+import threading
+import time
+import serial
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from std_msgs.msg import Int32MultiArray, Int8MultiArray, String
+from std_srvs.srv import Empty
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, TransformStamped, PoseStamped
+from nav2_msgs.action import NavigateToPose
+from action_msgs.msg import GoalStatusArray
+from tf2_ros import TransformBroadcaster
+import tf_transformations
+
+class ESPSerialBridge(Node):
+    def __init__(self):
+        super().__init__('esp_serial_bridge')
+        self.declare_parameter('port', '/dev/ttyUSB0')
+        self.declare_parameter('baud', 115200)
+        self.declare_parameter('frame_id', 'base_link')
+        self.declare_parameter('wheel_radius', 0.035)  # meters
+        self.declare_parameter('wheelbase', 0.24)      # meters  
+        self.declare_parameter('ticks_per_rev', 231)   # encoder ticks per wheel revolution
+        
+        self.port = self.get_parameter('port').get_parameter_value().string_value
+        self.baud = self.get_parameter('baud').get_parameter_value().integer_value
+        self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        self.wheel_radius = self.get_parameter('wheel_radius').get_parameter_value().double_value
+        self.wheelbase = self.get_parameter('wheelbase').get_parameter_value().double_value
+        self.ticks_per_rev = self.get_parameter('ticks_per_rev').get_parameter_value().integer_value
+        
+        # Odometry state
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.last_left_ticks = 0
+        self.last_right_ticks = 0
+        self.last_time = self.get_clock().now()
+        self.first_reading = True
+        
+        # Path tracking
+        self.path = Path()
+        self.path.header.frame_id = 'odom'
+        self.path_update_distance = 0.05  # Add point every 5cm
+        self.last_path_x = 0.0
+        self.last_path_y = 0.0
+
+        self.cb_group = ReentrantCallbackGroup()
+
+        # QoS for sensor data (best effort)
+        qos_sensor = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        # QoS for odometry (reliable - Nav2 requirement)
+        qos_odom = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        self.pub_enc = self.create_publisher(Int32MultiArray, 'esp/encoder_counts', qos_sensor)
+        self.pub_line = self.create_publisher(Int8MultiArray, 'esp/line_sensors', qos_sensor)
+        self.pub_raw = self.create_publisher(String, 'esp/raw', qos_sensor)
+        self.pub_odom = self.create_publisher(Odometry, 'odom', qos_odom)
+        self.pub_path = self.create_publisher(Path, 'robot_path', qos_odom)
+        
+        # Subscribe to cmd_vel for teleoperation and navigation
+        self.cmd_vel_sub = self.create_subscription(
+            Twist,
+            'cmd_vel',
+            self._cmd_vel_callback,
+            10
+        )
+        
+        # Subscribe to Nav2 goal status
+        self.goal_status_sub = self.create_subscription(
+            GoalStatusArray,
+            'navigate_to_pose/_action/status',
+            self._goal_status_callback,
+            10
+        )
+        
+        # TF broadcaster for odometry
+        self.tf_broadcaster = TransformBroadcaster(self)
+        
+        # Nav2 action client for goal status monitoring
+        self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.current_goal_handle = None
+        self.is_spinning = False
+
+        self.srv_reset = self.create_service(Empty, 'esp/reset_encoders', self._handle_reset, callback_group=self.cb_group)
+
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                timeout=1.0,
+                write_timeout=1.0,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False
+            )
+            # Flush any stale data
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+            time.sleep(0.1)  # Give port time to stabilize
+            self.get_logger().info(f'Opened serial {self.port} at {self.baud}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to open serial: {e}')
+            raise
+
+        self._stop = threading.Event()
+        self.reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader.start()
+
+        self.timer = self.create_timer(1.0, self._periodic_ping)
+        # Publish TF at steady rate (50Hz) even when stationary
+        self.tf_timer = self.create_timer(0.02, self._publish_current_tf)
+
+    def _periodic_ping(self):
+        try:
+            self.ser.write(b'GET\n')
+        except Exception as e:
+            self.get_logger().warn(f'Write failed: {e}')
+    
+    def _publish_current_tf(self):
+        """Publish TF transform at steady rate for AMCL compatibility"""
+        current_time = self.get_clock().now()
+        stamp_offset = rclpy.duration.Duration(seconds=0.1)
+        future_time = current_time + stamp_offset
+        
+        # Broadcast current robot pose as TF
+        t = TransformStamped()
+        t.header.stamp = future_time.to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = 'base_footprint'
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
+        t.transform.translation.z = 0.0
+        
+        quat = tf_transformations.quaternion_from_euler(0, 0, self.theta)
+        t.transform.rotation.x = quat[0]
+        t.transform.rotation.y = quat[1]
+        t.transform.rotation.z = quat[2]
+        t.transform.rotation.w = quat[3]
+        
+        self.tf_broadcaster.sendTransform(t)
+
+    def _cmd_vel_callback(self, msg):
+        """Convert cmd_vel (Twist) to differential wheel velocities and send PID_VEL command"""
+        # Extract linear and angular velocities
+        linear_vel = msg.linear.x  # m/s forward
+        angular_vel = msg.angular.z  # rad/s rotation (positive = counter-clockwise)
+        
+        # Differential drive kinematics for a robot rotating about its center:
+        # For pure rotation (linear_vel = 0):
+        #   left wheel moves backward at speed: -angular_vel * wheelbase/2
+        #   right wheel moves forward at speed: +angular_vel * wheelbase/2
+        # For pure forward motion (angular_vel = 0):
+        #   both wheels move forward at linear_vel
+        # Combined:
+        #   v_left = linear_vel - (angular_vel * wheelbase / 2)
+        #   v_right = linear_vel + (angular_vel * wheelbase / 2)
+        
+        left_vel = linear_vel - (angular_vel * self.wheelbase / 2.0)
+        right_vel = linear_vel + (angular_vel * self.wheelbase / 2.0)
+        
+        # Send PID_VEL command to ESP32
+        try:
+            cmd = f'PID_VEL,{left_vel:.3f},{right_vel:.3f}\n'
+            self.ser.write(cmd.encode('utf-8'))
+            self.get_logger().info(f'cmd_vel: lin={linear_vel:.3f} ang={angular_vel:.3f} → L={left_vel:.3f} R={right_vel:.3f} (wb={self.wheelbase})')
+        except Exception as e:
+            self.get_logger().warn(f'Failed to send velocity command: {e}')
+    
+    def _goal_status_callback(self, msg):
+        """Monitor Nav2 goal status"""
+        # GoalStatusArray contains a list of status_list
+        # STATUS_SUCCEEDED = 4
+        if not msg.status_list:
+            return
+        
+        # Check the most recent goal status
+        latest_status = msg.status_list[-1]
+        if latest_status.status == 4:  # STATUS_SUCCEEDED = 4
+            self.get_logger().info('🎯 Goal reached!')
+            # Celebration spin disabled
+    
+    def _reset_spin_flag(self):
+        """Reset spinning flag after celebration completes"""
+        self.is_spinning = False
+
+    def _handle_reset(self, request, response):
+        try:
+            self.ser.write(b'R\n')
+            # Reset odometry state
+            self.x = 0.0
+            self.y = 0.0
+            self.theta = 0.0
+            self.first_reading = True
+            
+            # Clear path
+            self.path.poses.clear()
+            self.last_path_x = 0.0
+            self.last_path_y = 0.0
+            
+            self.get_logger().info('Reset encoders, odometry, and path')
+        except Exception as e:
+            self.get_logger().warn(f'Write failed: {e}')
+        return response
+
+    def _reader_loop(self):
+        buf = bytearray()
+        while not self._stop.is_set():
+            try:
+                data = self.ser.read(128)
+                if data:
+                    buf.extend(data)
+                    while b'\n' in buf:
+                        line, _, rest = buf.partition(b'\n')
+                        buf = bytearray(rest)
+                        self._handle_line(line.decode(errors='ignore').strip())
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                self.get_logger().warn(f'Read failed: {e}')
+                time.sleep(0.5)
+
+    def _handle_line(self, line: str):
+        # Publish raw line for debugging
+        self.pub_raw.publish(String(data=line))
+        if not line:
+            return
+        # Telemetry: T,<ms>,<L>,<R>,<s1>,<s2>,<s3>,<s4>,<s5>
+        if line.startswith('T,'):
+            parts = line.split(',')
+            if len(parts) == 9:
+                try:
+                    # ms = int(parts[1])  # unused here
+                    L = int(parts[2])
+                    R = int(parts[3])
+                    s_vals = [int(x) for x in parts[4:9]]
+                    self._pub_encoders(L, R)
+                    self._pub_line_sensors(s_vals)
+                except ValueError:
+                    pass
+        # Ack or other lines are ignored
+
+    def _pub_encoders(self, L: int, R: int):
+        msg = Int32MultiArray()
+        msg.data = [L, R]
+        self.pub_enc.publish(msg)
+        
+        # Calculate and publish odometry
+        self._update_odometry(L, R)
+
+    def _pub_line_sensors(self, s_vals):
+        msg = Int8MultiArray()
+        msg.data = s_vals
+        self.pub_line.publish(msg)
+    
+    def _update_odometry(self, left_ticks: int, right_ticks: int):
+        current_time = self.get_clock().now()
+        
+        if self.first_reading:
+            # Initialize on first reading
+            self.last_left_ticks = left_ticks
+            self.last_right_ticks = right_ticks
+            self.last_time = current_time
+            self.first_reading = False
+            return
+        
+        # Calculate change in encoder ticks
+        delta_left = left_ticks - self.last_left_ticks
+        delta_right = -(right_ticks - self.last_right_ticks)  # Negate for reversed encoder
+        
+        # Convert ticks to distance (meters)
+        meters_per_tick = (2.0 * math.pi * self.wheel_radius) / self.ticks_per_rev
+        left_distance = delta_left * meters_per_tick
+        right_distance = delta_right * meters_per_tick
+        
+        # Calculate robot motion
+        distance = (left_distance + right_distance) / 2.0
+        delta_theta = (right_distance - left_distance) / self.wheelbase
+        
+        # Update robot pose
+        delta_x = distance * math.cos(self.theta + delta_theta / 2.0)
+        delta_y = distance * math.sin(self.theta + delta_theta / 2.0)
+        
+        self.x += delta_x
+        self.y += delta_y
+        self.theta += delta_theta
+        
+        # Normalize theta to [-pi, pi]
+        while self.theta > math.pi:
+            self.theta -= 2.0 * math.pi
+        while self.theta < -math.pi:
+            self.theta += 2.0 * math.pi
+        
+        # Calculate velocities
+        dt = (current_time - self.last_time).nanoseconds / 1e9
+        if dt > 0:
+            linear_vel = distance / dt
+            angular_vel = delta_theta / dt
+        else:
+            linear_vel = 0.0
+            angular_vel = 0.0
+        
+        # Publish odometry message
+        self._publish_odometry(current_time, linear_vel, angular_vel)
+        
+        # Update last values
+        self.last_left_ticks = left_ticks
+        self.last_right_ticks = right_ticks
+        self.last_time = current_time
+    
+    def _publish_odometry(self, current_time, linear_vel: float, angular_vel: float):
+        # Add small offset to timestamp for TF lookup tolerance
+        # This prevents "extrapolation into the future" warnings
+        stamp_offset = rclpy.duration.Duration(seconds=0.1)
+        future_time = current_time + stamp_offset
+        
+        # Create odometry message
+        odom = Odometry()
+        odom.header.stamp = future_time.to_msg()
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id = 'base_footprint'  # AMCL expects base_footprint
+        
+        # Position
+        odom.pose.pose.position = Point(x=self.x, y=self.y, z=0.0)
+        
+        # Orientation (quaternion from yaw)
+        quat = tf_transformations.quaternion_from_euler(0, 0, self.theta)
+        odom.pose.pose.orientation = Quaternion(x=quat[0], y=quat[1], z=quat[2], w=quat[3])
+        
+        # Velocity
+        odom.twist.twist.linear = Vector3(x=linear_vel, y=0.0, z=0.0)
+        odom.twist.twist.angular = Vector3(x=0.0, y=0.0, z=angular_vel)
+        
+        # Covariance (simple diagonal values - can be tuned)
+        odom.pose.covariance[0] = 0.01   # x
+        odom.pose.covariance[7] = 0.01   # y  
+        odom.pose.covariance[35] = 0.02  # theta
+        odom.twist.covariance[0] = 0.01  # vx
+        odom.twist.covariance[35] = 0.02 # vtheta
+        
+        self.pub_odom.publish(odom)
+        
+        # Update path tracking
+        self._update_path(current_time)
+        
+        # Broadcast TF transform (must match odometry child_frame_id for AMCL)
+        t = TransformStamped()
+        t.header.stamp = future_time.to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = 'base_footprint'  # Must match odom.child_frame_id for AMCL
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
+        t.transform.translation.z = 0.0
+        t.transform.rotation.x = quat[0]
+        t.transform.rotation.y = quat[1]
+        t.transform.rotation.z = quat[2]
+        t.transform.rotation.w = quat[3]
+        
+        self.tf_broadcaster.sendTransform(t)
+    
+    def _update_path(self, current_time):
+        """Add current position to path if robot has moved enough"""
+        # Calculate distance from last path point
+        dx = self.x - self.last_path_x
+        dy = self.y - self.last_path_y
+        distance = math.sqrt(dx*dx + dy*dy)
+        
+        # Only add point if moved enough distance
+        if distance >= self.path_update_distance:
+            # Use current_time (not future_time) for path visualization
+            pose = PoseStamped()
+            pose.header.stamp = current_time.to_msg()
+            pose.header.frame_id = 'odom'
+            pose.pose.position = Point(x=self.x, y=self.y, z=0.0)
+            
+            # Orientation (quaternion from yaw)
+            quat = tf_transformations.quaternion_from_euler(0, 0, self.theta)
+            pose.pose.orientation = Quaternion(x=quat[0], y=quat[1], z=quat[2], w=quat[3])
+            
+            self.path.poses.append(pose)
+            self.path.header.stamp = current_time.to_msg()
+            
+            # Update last path position
+            self.last_path_x = self.x
+            self.last_path_y = self.y
+            
+            # Publish updated path
+            self.pub_path.publish(self.path)
+
+    def destroy_node(self):
+        self._stop.set()
+        try:
+            if hasattr(self, 'ser') and self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ESPSerialBridge()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
